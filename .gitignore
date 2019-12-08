@@ -18,6 +18,7 @@ project/plugins/project/
 *.pyc
 
 # Intellij specific
+.idea/
 #
 
 User-specific stuff:

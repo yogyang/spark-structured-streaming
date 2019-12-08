@@ -5,14 +5,14 @@ package com.kafkaToSparkToCass
   */
 import java.sql.Timestamp
 import java.text.{DateFormat, SimpleDateFormat}
+import java.time.LocalTime
 
 import com.datastax.driver.core.Session
-
-import collection.JavaConversions._
 import org.apache.log4j.Logger
 import org.apache.log4j.Level
-import com.datastax.spark.connector.cql.CassandraConnector
+import com.kafkaToSparkToCass.model.{PayLoad, RawMsgEvent, UserMsgState}
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.streaming.{GroupState, GroupStateTimeout, OutputMode}
 
 object Main {
 
@@ -36,7 +36,59 @@ object Main {
         logger.error(ex.getStackTrace.toString)
     }
   }
+
+  def convertStateToPayLoad(
+                           state: UserMsgState
+                           ): (Iterator[PayLoad], Long) = {
+    logger.info("convert state to payload for state: " + state)
+    val count = state.eventCount / 5
+    val payloads = (0L until count).map{
+      i => PayLoad(state.userId, state.maxTimeMs)
+    }.toIterator
+
+    (payloads, count)
+
+  }
+
+  def updateStateFn(
+                   userId: String,
+                   events: Iterator[RawMsgEvent],
+                   state: GroupState[UserMsgState]
+                   ): Iterator[PayLoad] = {
+    if (state.hasTimedOut) {
+      val finalState = state.get
+      logger.info("session timeout for userId " + userId)
+      state.remove()
+
+      //Iterator(finalState)
+      convertStateToPayLoad(finalState)._1
+    } else {
+      val currentState = state.getOption
+      val aggregatedState = events.foldLeft(currentState)(
+        (state, event) => {
+          state.orElse{
+            logger.info("created new state as no state for userid " + userId)
+            Some(UserMsgState(event.userId, event.time.getTime, 0))
+          }.map{
+            s => s.increaseEventCount()
+          }.map{
+            s => s.updateMaxTimeMs(event.time.getTime)
+          }
+        }
+      ).get
+
+      val (payLoads, payLoadCount) = convertStateToPayLoad(aggregatedState)
+      state.setTimeoutTimestamp(aggregatedState.maxTimeMs, "2 minutes")
+      state.update(aggregatedState.decrementBy(5 * payLoadCount))
+      //Iterator(aggregatedState)
+      logger.info("Payload lenth for this batch:" + payLoadCount)
+      logger.info("updated state:" + state.get)
+      payLoads
+
+    }
+  }
 }
+
 
 class SparkJob extends Serializable {
   @transient lazy val logger = Logger.getLogger(this.getClass)
@@ -45,22 +97,9 @@ class SparkJob extends Serializable {
   val sparkSession =
     SparkSession.builder
       .master("local[*]")
-      .appName("kafka2Spark2Cassandra")
-      .config("spark.cassandra.connection.host", "localhost")
+      .appName("kafka2Spark")
       .getOrCreate()
 
-  val connector = CassandraConnector.apply(sparkSession.sparkContext.getConf)
-
-  // Create keyspace and tables here, NOT in prod
-  connector.withSessionDo { session =>
-    Statements.createKeySpaceAndTable(session, true)
-  }
-
-  private def processRow(value: Commons.UserEvent) = {
-    connector.withSessionDo { session =>
-      session.execute(Statements.cql(value.user_id, value.time, value.event))
-    }
-  }
 
   def runJob() = {
 
@@ -68,42 +107,48 @@ class SparkJob extends Serializable {
     val cols = List("user_id", "time", "event")
 
     import sparkSession.implicits._
-    val lines = sparkSession.readStream
+
+    val streamDF = sparkSession.readStream
       .format("kafka")
       .option("subscribe", "test.1")
       .option("kafka.bootstrap.servers", "localhost:9092")
-      .option("startingOffsets", "earliest")
+      .option("startingOffsets", "latest")
       .load()
+//    streamDF.printSchema()
+
+    val lines = streamDF
       .selectExpr("CAST(value AS STRING)",
                   "CAST(topic as STRING)",
                   "CAST(partition as INTEGER)")
       .as[(String, String, Integer)]
 
+
     val df =
-      lines.map { line =>
-        val columns = line._1.split(";") // value being sent out as a comma separated value "userid_1;2015-05-01T00:00:00;some_value"
-        (columns(0), Commons.getTimeStamp(columns(1)), columns(2))
-      }.toDF(cols: _*)
+      lines.map {
+        line => {
+          // value being sent out as a comma separated value "userid_1;2015-05-01T00:00:00;some_value"
+          val columns = line._1.split(";")
+          RawMsgEvent(columns(0), Commons.getTimeStamp(columns(1)), columns(2))
 
-    df.printSchema()
+        }
+      }.as[RawMsgEvent]
 
-    // Run your business logic here
-    val ds = df.select($"user_id", $"time", $"event").as[Commons.UserEvent]
+//    df.printSchema()
 
-    // This Foreach sink writer writes the output to cassandra.
-    import org.apache.spark.sql.ForeachWriter
-    val writer = new ForeachWriter[Commons.UserEvent] {
-      override def open(partitionId: Long, version: Long) = true
-      override def process(value: Commons.UserEvent) = {
-        processRow(value)
-      }
-      override def close(errorOrNull: Throwable) = {}
-    }
+    import com.kafkaToSparkToCass.Main._
 
-    val query =
-      ds.writeStream.queryName("kafka2Spark2Cassandra").foreach(writer).start
+    val finalDF = df
+      .withWatermark("time", "3 seconds")
+      .groupByKey(_.userId)
+      .flatMapGroupsWithState(OutputMode.Complete(), GroupStateTimeout.EventTimeTimeout())(updateStateFn)
 
-    query.awaitTermination()
-    sparkSession.stop()
+    val consoleOutput = finalDF.writeStream
+      .queryName("testStreaming")
+      .format("console")
+      .start()
+
+    consoleOutput.awaitTermination()
+
+
   }
 }
